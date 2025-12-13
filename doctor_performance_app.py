@@ -20,13 +20,24 @@ def safe_month_label(n):
     except Exception:
         return ""
 
-def normalize(df):
-    df.columns = [str(c).strip() for c in df.columns]
+def normalize_colnames(df):
+    df.columns = [" ".join(str(c).strip().split()) for c in df.columns]
     return df
 
-def find_col(df, target):
+def find_col(df, *candidates):
+    """
+    Case-insensitive finder across multiple candidates.
+    Accepts aliases like ("DocName","Doc Name","Doctor","Doctor Name","Provider").
+    """
+    wanted = {c.lower().strip(): c for c in candidates}
     for c in df.columns:
-        if c.lower().strip() == target.lower():
+        key = str(c).lower().strip()
+        if key in wanted:
+            return c
+    # heuristic: strip spaces and look for doc/doctor/provider tokens
+    for c in df.columns:
+        key = str(c).lower().replace(" ", "")
+        if any(k in key for k in ["docname","doc","doctor","provider","physician"]):
             return c
     return None
 
@@ -34,15 +45,20 @@ def find_col(df, target):
 def load_excel(file):
     return pd.read_excel(file, sheet_name=0, engine="openpyxl")
 
-def process_file(df):
-    df = normalize(df)
-    v = find_col(df, "VisitNo")
-    d = find_col(df, "VisitDate")
-    n = find_col(df, "DocName")
-    g = find_col(df, "Item Group")
-    a = find_col(df, "ActivityIns")
-    if None in [v, d, n, g, a]:
-        raise ValueError("Missing one or more required columns.")
+def process_file(df_in):
+    df = normalize_colnames(df_in.copy())
+
+    v = find_col(df, "VisitNo", "Visit No", "Visit_ID", "Visit Id")
+    d = find_col(df, "VisitDate", "Visit Date", "Date")
+    n = find_col(df, "DocName", "Doc Name", "Doctor", "Doctor Name", "Provider", "Provider Name")
+    g = find_col(df, "Item Group", "ItemGroup", "Group")
+    a = find_col(df, "ActivityIns", "Activity Ins", "Amount", "NetAmount", "Net Amount")
+
+    missing = [label for label, col in [
+        ("VisitNo", v), ("VisitDate", d), ("DocName", n), ("Item Group", g), ("ActivityIns", a)
+    ] if col is None]
+    if missing:
+        raise ValueError(f"Missing required column(s): {missing}")
 
     # Unique visits
     df[v] = df[v].astype(str).str.strip()
@@ -60,14 +76,9 @@ def process_file(df):
     # Buckets
     ig = df[g].astype(str).str.title()
     bucket_map = {
-        "Consultation": "Consultation",
-        "Consultations": "Consultation",
-        "Medicine": "Medicines",
-        "Medicines": "Medicines",
-        "Drug": "Medicines",
-        "Drugs": "Medicines",
-        "Procedure": "Procedure",
-        "Procedures": "Procedure",
+        "Consultation": "Consultation", "Consultations": "Consultation",
+        "Medicine": "Medicines", "Medicines": "Medicines", "Drug": "Medicines", "Drugs": "Medicines",
+        "Procedure": "Procedure", "Procedures": "Procedure",
     }
     df["Bucket"] = ig.map(bucket_map).fillna("Other")
 
@@ -86,7 +97,6 @@ def process_file(df):
 
     # Visits per month
     visits = df.groupby([n, "Year", "MonthNum", "Month"])[v].nunique().reset_index(name="Visits")
-
     out = piv.merge(visits, on=[n, "Year", "MonthNum", "Month"], how="left")
 
     # Avg per visit (no Row_Total kept for final view)
@@ -96,6 +106,10 @@ def process_file(df):
     )
 
     out = out.sort_values([n, "Year", "MonthNum"]).reset_index(drop=True)
+
+    # 🔒 Standardize the doctor column name so the View code always finds it
+    out = out.rename(columns={n: "DocName"})
+
     return out
 
 def to_excel_bytes(df, name="Doctor_Summary"):
@@ -141,26 +155,28 @@ else:
     if df is None or df.empty:
         st.info("No processed data yet. Switch to Admin, upload & process first.")
     else:
-        # Doctor option (dropdown)
-        doc_col = next((c for c in df.columns if c.lower() == "docname"), df.columns[0])
+        # Robust doctor column detection (now standardized to "DocName")
+        doc_col = "DocName" if "DocName" in df.columns else next(iter(df.columns))
         doctors = sorted(df[doc_col].dropna().astype(str).unique().tolist())
-        selected_doc = st.selectbox("Select Doctor", doctors, index=0)
 
-        sel_df = df[df[doc_col] == selected_doc].copy().sort_values(["Year", "MonthNum"])
+        if not doctors:
+            st.warning("No doctors found in processed data.")
+        else:
+            selected_doc = st.selectbox("Select Doctor", doctors, index=0)
 
-        # Show clean columns (no MonthNum, no Row_Total)
-        view_cols = ["Year", "Month", "Visits", "Consultation", "Medicines", "Procedure", "Other", "Avg_per_Visit"]
-        sel_df = sel_df[view_cols]
+            sel_df = df[df[doc_col] == selected_doc].copy().sort_values(["Year", "MonthNum"])
+            view_cols = ["Year", "Month", "Visits", "Consultation", "Medicines", "Procedure", "Other", "Avg_per_Visit"]
+            sel_df = sel_df[view_cols]
 
-        st.success(f"Doctor: **{selected_doc}**")
-        st.dataframe(sel_df, use_container_width=True)
+            st.success(f"Doctor: **{selected_doc}**")
+            st.dataframe(sel_df, use_container_width=True)
 
-        xbytes = to_excel_bytes(sel_df, selected_doc)
-        st.download_button(
-            "Download Selected Doctor (xlsx)",
-            data=xbytes,
-            file_name=f"doc_performance_{selected_doc}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+            xbytes = to_excel_bytes(sel_df, selected_doc)
+            st.download_button(
+                "Download Selected Doctor (xlsx)",
+                data=xbytes,
+                file_name=f"doc_performance_{selected_doc}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
