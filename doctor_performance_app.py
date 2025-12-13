@@ -44,14 +44,20 @@ def process_file(df):
     if None in [v, d, n, g, a]:
         raise ValueError("Missing one or more required columns.")
 
+    # Unique visits
     df[v] = df[v].astype(str).str.strip()
     df = df.drop_duplicates(subset=[v])
+
+    # Dates → Year/Month
     dt = pd.to_datetime(df[d], errors="coerce")
     df["Year"] = dt.dt.year
     df["MonthNum"] = dt.dt.month.astype("Int64")
     df["Month"] = df["MonthNum"].apply(safe_month_label)
+
+    # Amount
     df[a] = pd.to_numeric(df[a], errors="coerce").fillna(0)
 
+    # Buckets
     ig = df[g].astype(str).str.title()
     bucket_map = {
         "Consultation": "Consultation",
@@ -65,6 +71,7 @@ def process_file(df):
     }
     df["Bucket"] = ig.map(bucket_map).fillna("Other")
 
+    # Aggregate
     piv = df.pivot_table(
         index=[n, "Year", "MonthNum", "Month"],
         columns="Bucket",
@@ -77,14 +84,17 @@ def process_file(df):
         if col not in piv.columns:
             piv[col] = 0
 
+    # Visits per month
     visits = df.groupby([n, "Year", "MonthNum", "Month"])[v].nunique().reset_index(name="Visits")
+
     out = piv.merge(visits, on=[n, "Year", "MonthNum", "Month"], how="left")
+
+    # Avg per visit (no Row_Total kept for final view)
     out["Avg_per_Visit"] = (
-        (out[["Consultation", "Medicines", "Procedure", "Other"]].sum(axis=1) / out["Visits"])
-        .round(0)
-        .fillna(0)
-        .astype(int)
+        (out[["Consultation", "Medicines", "Procedure", "Other"]].sum(axis=1) / out["Visits"].replace(0, pd.NA))
+        .round(0).fillna(0).astype(int)
     )
+
     out = out.sort_values([n, "Year", "MonthNum"]).reset_index(drop=True)
     return out
 
@@ -95,14 +105,14 @@ def to_excel_bytes(df, name="Doctor_Summary"):
     return buf.getvalue()
 
 # ================== MODE ==================
-mode = st.toggle("Admin mode", value=False)
+mode = st.toggle("Admin mode", value=False, help="ON = upload & process; OFF = view")
 
 # ================== ADMIN ==================
 if mode:
     st.subheader("Admin — Upload & Process File")
     file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
-    colA, colB = st.columns([1, 2])
-    if colA.button("Process", type="primary"):
+    cols = st.columns([1, 2])
+    if cols[0].button("Process", type="primary"):
         if not file:
             st.error("Please upload a file first.")
         else:
@@ -110,7 +120,7 @@ if mode:
                 df = load_excel(file)
                 result = process_file(df)
                 st.session_state["processed_df"] = result
-                st.success("✅ Processed successfully.")
+                st.success("✅ Processed and saved for viewing.")
                 st.dataframe(result.head(10), use_container_width=True)
                 xbytes = to_excel_bytes(result)
                 st.download_button(
@@ -118,34 +128,27 @@ if mode:
                     data=xbytes,
                     file_name="doc_performance_all.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
                 )
             except Exception as e:
                 st.error(f"Error: {e}")
 
 # ================== VIEW ==================
 else:
-    st.subheader("View — Select Doctor Performance")
+    st.subheader("View — Doctor Monthwise Performance")
     df = st.session_state.get("processed_df")
 
     if df is None or df.empty:
-        st.info("No processed data yet. Please switch to Admin mode, upload & process first.")
+        st.info("No processed data yet. Switch to Admin, upload & process first.")
     else:
-        # Doctor list
-        doc_col = [c for c in df.columns if c.lower() == "docname"]
-        doc_col = doc_col[0] if doc_col else df.columns[0]
-        doctors = sorted(df[doc_col].dropna().unique().tolist())
+        # Doctor option (dropdown)
+        doc_col = next((c for c in df.columns if c.lower() == "docname"), df.columns[0])
+        doctors = sorted(df[doc_col].dropna().astype(str).unique().tolist())
+        selected_doc = st.selectbox("Select Doctor", doctors, index=0)
 
-        # Slider style selection
-        selected_doc = st.select_slider(
-            "Slide to select Doctor",
-            options=doctors,
-            value=doctors[0],
-        )
+        sel_df = df[df[doc_col] == selected_doc].copy().sort_values(["Year", "MonthNum"])
 
-        sel_df = df[df[doc_col] == selected_doc].copy()
-        sel_df = sel_df.sort_values(["Year", "MonthNum"])
-
-        # Remove MonthNum and show clean
+        # Show clean columns (no MonthNum, no Row_Total)
         view_cols = ["Year", "Month", "Visits", "Consultation", "Medicines", "Procedure", "Other", "Avg_per_Visit"]
         sel_df = sel_df[view_cols]
 
@@ -158,4 +161,6 @@ else:
             data=xbytes,
             file_name=f"doc_performance_{selected_doc}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
+
