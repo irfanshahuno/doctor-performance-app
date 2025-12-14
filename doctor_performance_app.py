@@ -30,7 +30,7 @@ def normalize_cols(df):
     return df
 
 def find_col(df, *candidates):
-    # case-insensitive exact; then heuristic for doctor/provider
+    """Case-insensitive exact; then heuristic for doctor/provider-like columns."""
     want = {c.lower().strip(): c for c in candidates}
     for c in df.columns:
         key = str(c).lower().strip()
@@ -47,6 +47,7 @@ def load_excel(file):
     return pd.read_excel(file, sheet_name=0, engine="openpyxl")
 
 def process_file(df_in) -> pd.DataFrame:
+    """Build month-wise doctor summary with Total & Avg_per_Visit."""
     df = normalize_cols(df_in.copy())
 
     v = find_col(df, "VisitNo", "Visit No", "Visit_ID", "Visit Id")
@@ -83,7 +84,7 @@ def process_file(df_in) -> pd.DataFrame:
     }
     df["Bucket"] = ig.map(bucket_map).fillna("Other")
 
-    # Aggregate amounts
+    # Aggregate amounts by Doctor × Year × Month × Bucket
     piv = (
         df.pivot_table(
             index=[n, "Year", "MonthNum", "Month"],
@@ -98,7 +99,7 @@ def process_file(df_in) -> pd.DataFrame:
         if col not in piv.columns:
             piv[col] = 0
 
-    # Visits per month
+    # Visits per month (distinct VisitNo)
     visits = (
         df.groupby([n, "Year", "MonthNum", "Month"])[v]
           .nunique()
@@ -107,10 +108,10 @@ def process_file(df_in) -> pd.DataFrame:
 
     out = piv.merge(visits, on=[n, "Year", "MonthNum", "Month"], how="left")
 
-    # Avg per visit = round((Consultation+Medicines+Procedure+Other)/Visits)
-    row_total = out[["Consultation","Medicines","Procedure","Other"]].sum(axis=1)
+    # ---- Total & Avg per visit ----
+    out["Total"] = out[["Consultation","Medicines","Procedure","Other"]].sum(axis=1)
     out["Avg_per_Visit"] = (
-        (row_total / out["Visits"].replace(0, pd.NA))
+        (out["Total"] / out["Visits"].replace(0, pd.NA))
         .round(0)
         .fillna(0)
         .astype(int)
@@ -125,6 +126,39 @@ def to_excel_bytes(df, sheet="Doctor_Summary"):
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         df.to_excel(xw, index=False, sheet_name=sheet)
     return buf.getvalue()
+
+def render_center_view(center_key: str):
+    """Doctor dropdown + month table + downloads for the selected center."""
+    data = st.session_state["center_data"].get(center_key)
+    if data is None or (isinstance(data, pd.DataFrame) and data.empty):
+        st.info(f"No processed data for {CENTERS[center_key]} yet. Turn ON Admin, upload and click Process.")
+        return
+
+    doctors = sorted(data["DocName"].dropna().astype(str).unique().tolist())
+    selected = st.selectbox("Select Doctor", doctors, index=0, key=f"doc_select_{center_key}")
+
+    # Filter & sort
+    view = data.loc[data["DocName"] == selected, [
+        "Year","Month","Consultation","Medicines","Procedure","Other","Total","Visits","Avg_per_Visit","MonthNum"
+    ]].copy()
+    view = view.sort_values(["Year","MonthNum"]).reset_index(drop=True)
+
+    # Display Year as plain string (avoid 2,024 formatting)
+    view["Year"] = view["Year"].fillna(0).astype("Int64").astype(str)
+
+    # Show table without MonthNum
+    st.success(f"Doctor: **{selected}** — {CENTERS[center_key]}")
+    display_cols = ["Year","Month","Consultation","Medicines","Procedure","Other","Total","Visits","Avg_per_Visit"]
+    st.dataframe(view[display_cols], use_container_width=True)
+
+    # Downloads
+    st.download_button(
+        f"Download Selected Doctor ({CENTERS[center_key]})",
+        data=to_excel_bytes(view.drop(columns=["MonthNum"]), sheet=selected[:30]),
+        file_name=f"doc_performance_{center_key}_{selected}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 # ================== MODE TOGGLE ==================
 mode = st.toggle("Admin mode", value=False, help="ON = upload & process; OFF = view")
@@ -141,7 +175,11 @@ center_key = st.radio(
 # ================== ADMIN ==================
 if mode:
     st.subheader(f"Admin — Upload & Process ({CENTERS[center_key]})")
-    file = st.file_uploader(f"Upload Excel (.xlsx) for {CENTERS[center_key]}", type=["xlsx"], key=f"uploader_{center_key}")
+    file = st.file_uploader(
+        f"Upload Excel (.xlsx) for {CENTERS[center_key]}",
+        type=["xlsx"],
+        key=f"uploader_{center_key}"
+    )
 
     cols = st.columns([1, 2])
     if cols[0].button("Process", type="primary", use_container_width=True, key=f"process_{center_key}"):
@@ -153,46 +191,16 @@ if mode:
                 res = process_file(df)
                 st.session_state["center_data"][center_key] = res
                 st.success(f"✅ Processed and saved for {CENTERS[center_key]}.")
-                st.dataframe(res.head(12), use_container_width=True)
-                st.download_button(
-                    f"Download FULL ({CENTERS[center_key]}) Doctor Performance (xlsx)",
-                    data=to_excel_bytes(res),
-                    file_name=f"doc_performance_all_{center_key}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
             except Exception as e:
                 st.error(f"Error: {e}")
 
-# ================== DOCTOR VIEWER (per center) ==================
-st.subheader(f"Doctor Viewer — {CENTERS[center_key]} Monthwise Performance")
+    # 👉 Show the doctor option & filtered months immediately after (and anytime data exists)
+    st.subheader(f"Doctor Viewer — {CENTERS[center_key]}")
+    render_center_view(center_key)
 
-data = st.session_state["center_data"].get(center_key)
-if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-    st.info(f"No processed data for {CENTERS[center_key]} yet. Turn ON Admin, upload and click Process.")
+# ================== VIEW (no upload) ==================
 else:
-    doctors = sorted(data["DocName"].dropna().astype(str).unique().tolist())
-    selected = st.selectbox("Select Doctor", doctors, index=0, key=f"doc_select_{center_key}")
+    st.subheader(f"Doctor Viewer — {CENTERS[center_key]}")
+    render_center_view(center_key)
 
-    # Filter & sort
-    view = data.loc[data["DocName"] == selected, [
-        "Year","Month","Consultation","Medicines","Procedure","Other","Visits","Avg_per_Visit","MonthNum"
-    ]].copy()
-    view = view.sort_values(["Year","MonthNum"]).reset_index(drop=True)
-
-    # Display Year as plain string (avoid 2,024 formatting)
-    view["Year"] = view["Year"].fillna(0).astype("Int64").astype(str)
-
-    # Show table without MonthNum
-    display_cols = ["Year","Month","Consultation","Medicines","Procedure","Other","Visits","Avg_per_Visit"]
-    st.success(f"Doctor: **{selected}** — {CENTERS[center_key]}")
-    st.dataframe(view[display_cols], use_container_width=True)
-
-    st.download_button(
-        f"Download Selected Doctor ({CENTERS[center_key]})",
-        data=to_excel_bytes(view.drop(columns=["MonthNum"]), sheet=selected[:30]),
-        file_name=f"doc_performance_{center_key}_{selected}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
 
