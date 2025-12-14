@@ -47,35 +47,44 @@ def load_excel(file):
     return pd.read_excel(file, sheet_name=0, engine="openpyxl")
 
 def process_file(df_in) -> pd.DataFrame:
-    """Build month-wise doctor summary with Total & Avg_per_Visit."""
+    """
+    Build month-wise doctor summary with Total & Avg_per_Visit.
+
+    IMPORTANT FIX:
+    - Do NOT drop duplicates globally before summing money.
+    - Sum amounts over ALL rows in each group.
+    - Compute Visits using DISTINCT VisitNo per (Doc, Year, Month).
+    """
     df = normalize_cols(df_in.copy())
 
+    # locate columns (aliases + heuristic)
     v = find_col(df, "VisitNo", "Visit No", "Visit_ID", "Visit Id")
     d = find_col(df, "VisitDate", "Visit Date", "Date")
     n = find_col(df, "DocName", "Doc Name", "Doctor", "Doctor Name", "Provider", "Provider Name")
     g = find_col(df, "Item Group", "ItemGroup", "Group")
-    a = find_col(df, "ActivityIns", "Activity Ins", "Amount", "NetAmount", "Net Amount")
+    # Put your official amount column first in the list below (e.g., "Net Amount")
+    a = find_col(df, "Net Amount", "NetAmount", "ActivityIns", "Activity Ins", "Amount")
 
     missing = [label for label, col in [
-        ("VisitNo", v), ("VisitDate", d), ("DocName", n), ("Item Group", g), ("ActivityIns", a)
+        ("VisitNo", v), ("VisitDate", d), ("DocName", n), ("Item Group", g), ("Amount (Net/ActivityIns)", a)
     ] if col is None]
     if missing:
         raise ValueError(f"Missing required column(s): {missing}")
 
-    # Unique visits
-    df[v] = df[v].astype(str).str.strip()
-    df = df.drop_duplicates(subset=[v])
-
-    # Dates → Year/Month
+    # parse dates -> Year / Month
     dt = pd.to_datetime(df[d], errors="coerce")
     df["Year"] = dt.dt.year
     df["MonthNum"] = dt.dt.month.astype("Int64")
     df["Month"] = df["MonthNum"].apply(safe_month_label)
 
-    # Amount
+    # warn about rows with bad dates (won't land in any month)
+    bad_dates = int(df["MonthNum"].isna().sum())
+    if bad_dates > 0:
+        st.warning(f"{bad_dates} row(s) had invalid VisitDate and were excluded from month buckets.")
+
+    # normalize amounts & buckets
     df[a] = pd.to_numeric(df[a], errors="coerce").fillna(0)
 
-    # Buckets
     ig = df[g].astype(str).str.strip().str.title()
     bucket_map = {
         "Consultation": "Consultation", "Consultations": "Consultation",
@@ -84,9 +93,10 @@ def process_file(df_in) -> pd.DataFrame:
     }
     df["Bucket"] = ig.map(bucket_map).fillna("Other")
 
-    # Aggregate amounts by Doctor × Year × Month × Bucket
-    piv = (
-        df.pivot_table(
+    # ============== AMOUNTS (sum ALL lines) ==============
+    amounts = (
+        df[df["MonthNum"].notna()]
+        .pivot_table(
             index=[n, "Year", "MonthNum", "Month"],
             columns="Bucket",
             values=a,
@@ -96,19 +106,22 @@ def process_file(df_in) -> pd.DataFrame:
         .reset_index()
     )
     for col in ["Consultation", "Medicines", "Procedure", "Other"]:
-        if col not in piv.columns:
-            piv[col] = 0
+        if col not in amounts.columns:
+            amounts[col] = 0
 
-    # Visits per month (distinct VisitNo)
+    # ============== VISITS (distinct VisitNo) ==============
+    df_visits = df.loc[df["MonthNum"].notna(), [n, "Year", "MonthNum", "Month", v]].copy()
+    df_visits[v] = df_visits[v].astype(str).str.strip()
     visits = (
-        df.groupby([n, "Year", "MonthNum", "Month"])[v]
-          .nunique()
-          .reset_index(name="Visits")
+        df_visits.groupby([n, "Year", "MonthNum", "Month"])[v]
+                 .nunique()
+                 .reset_index(name="Visits")
     )
 
-    out = piv.merge(visits, on=[n, "Year", "MonthNum", "Month"], how="left")
+    # Merge & compute Total and Avg
+    out = amounts.merge(visits, on=[n, "Year", "MonthNum", "Month"], how="left")
+    out["Visits"] = out["Visits"].fillna(0).astype(int)
 
-    # ---- Total & Avg per visit ----
     out["Total"] = out[["Consultation","Medicines","Procedure","Other"]].sum(axis=1)
     out["Avg_per_Visit"] = (
         (out["Total"] / out["Visits"].replace(0, pd.NA))
@@ -194,7 +207,7 @@ if mode:
             except Exception as e:
                 st.error(f"Error: {e}")
 
-    # 👉 Show the doctor option & filtered months immediately after (and anytime data exists)
+    # Show doctor dropdown & table immediately
     st.subheader(f"Doctor Viewer — {CENTERS[center_key]}")
     render_center_view(center_key)
 
@@ -202,5 +215,4 @@ if mode:
 else:
     st.subheader(f"Doctor Viewer — {CENTERS[center_key]}")
     render_center_view(center_key)
-
 
